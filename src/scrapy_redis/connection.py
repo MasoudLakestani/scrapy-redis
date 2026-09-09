@@ -1,8 +1,9 @@
+import redis
 from scrapy.utils.misc import load_object
 
 from . import defaults
 
-# Shortcut maps 'setting name' -> 'parmater name'.
+# Shortcut maps 'setting name' -> 'parameter name'.
 SETTINGS_PARAMS_MAP = {
     "REDIS_URL": "url",
     "REDIS_HOST": "host",
@@ -13,58 +14,121 @@ SETTINGS_PARAMS_MAP = {
 
 SETTINGS_PARAMS_MAP["REDIS_DECODE_RESPONSES"] = "decode_responses"
 
+# Global registry of connection pools keyed by (url, pool_cls, params)
+_CONNECTION_POOLS = {}
 
-def get_redis_from_settings(settings):
-    """Returns a redis client instance from given Scrapy settings object.
 
-    This function uses ``get_client`` to instantiate the client and uses
-    ``defaults.REDIS_PARAMS`` global as defaults values for the parameters. You
-    can override them using the ``REDIS_PARAMS`` setting.
+def _make_hashable(val):
+    """Recursively convert nested dictionaries, lists, or unhashable objects
+    into hashable types so they can be safely used in dictionary keys."""
+    if isinstance(val, dict):
+        return tuple(sorted((k, _make_hashable(v)) for k, v in val.items()))
+    if isinstance(val, (list, set, tuple)):
+        return tuple(_make_hashable(v) for v in val)
+    try:
+        hash(val)
+        return val
+    except TypeError:
+        return str(val)
+
+
+def _get_pool_key(url, pool_cls, params):
+    """Generate a stable, hashable key for caching connection pools."""
+    return (
+        url,
+        pool_cls,
+        tuple(sorted((k, _make_hashable(v)) for k, v in params.items())),
+    )
+
+
+def get_connection_pool_from_settings(settings):
+    """Returns a redis ConnectionPool instance from given Scrapy settings object.
+
+    This function caches connection pools in ``_CONNECTION_POOLS`` global
+    so that multiple components (spider, scheduler, dupefilter, pipeline)
+    share the same connection pool when using the same connection settings.
 
     Parameters
     ----------
     settings : Settings
-        A scrapy settings object. See the supported settings below.
+        A scrapy settings object.
+
+    Returns
+    -------
+    redis.ConnectionPool
+        Redis connection pool instance.
+    """
+    params = defaults.REDIS_PARAMS.copy()
+    params.update(settings.getdict("REDIS_PARAMS"))
+    for source, dest in SETTINGS_PARAMS_MAP.items():
+        val = settings.get(source)
+        if val is not None:
+            params[dest] = val
+
+    # If the user already provided a connection pool, reuse it directly
+    if "connection_pool" in params:
+        return params["connection_pool"]
+
+    url = params.pop("url", None)
+    params.pop("redis_cls", None)
+
+    max_connections = settings.get(
+        "REDIS_MAX_CONNECTIONS", params.pop("max_connections", None)
+    )
+    if max_connections is not None:
+        params["max_connections"] = int(max_connections)
+
+    pool_cls = params.pop("connection_pool_cls", redis.ConnectionPool)
+    if isinstance(pool_cls, str):
+        pool_cls = load_object(pool_cls)
+
+    if not url:
+        params.setdefault("host", "localhost")
+        params.setdefault("port", 6379)
+
+    key = _get_pool_key(url, pool_cls, params)
+    if key not in _CONNECTION_POOLS:
+        if url:
+            _CONNECTION_POOLS[key] = pool_cls.from_url(url, **params)
+        else:
+            _CONNECTION_POOLS[key] = pool_cls(**params)
+
+    return _CONNECTION_POOLS[key]
+
+
+def get_redis_from_settings(settings):
+    """Returns a redis client instance from given Scrapy settings object.
+
+    This function uses ``get_connection_pool_from_settings`` to obtain a
+    shared connection pool and instantiates the client using that pool.
+
+    Parameters
+    ----------
+    settings : Settings
+        A scrapy settings object.
 
     Returns
     -------
     server
         Redis client instance.
-
-    Other Parameters
-    ----------------
-    REDIS_URL : str, optional
-        Server connection URL.
-    REDIS_HOST : str, optional
-        Server host.
-    REDIS_PORT : str, optional
-        Server port.
-    REDIS_DB : int, optional
-        Server database
-    REDIS_ENCODING : str, optional
-        Data encoding.
-    REDIS_PARAMS : dict, optional
-        Additional client parameters.
-
-    Python 3 Only
-    ----------------
-    REDIS_DECODE_RESPONSES : bool, optional
-        Sets the `decode_responses` kwarg in Redis cls ctor
-
     """
     params = defaults.REDIS_PARAMS.copy()
     params.update(settings.getdict("REDIS_PARAMS"))
-    # XXX: Deprecate REDIS_* settings.
     for source, dest in SETTINGS_PARAMS_MAP.items():
         val = settings.get(source)
-        if val:
+        if val is not None:
             params[dest] = val
 
-    # Allow ``redis_cls`` to be a path to a class.
-    if isinstance(params.get("redis_cls"), str):
-        params["redis_cls"] = load_object(params["redis_cls"])
+    redis_cls = params.pop("redis_cls", defaults.REDIS_CLS)
+    if isinstance(redis_cls, str):
+        redis_cls = load_object(redis_cls)
 
-    return get_redis(**params)
+    # If a custom connection_pool was explicitly provided, pass it directly
+    if "connection_pool" in params:
+        return redis_cls(**params)
+
+    pool = get_connection_pool_from_settings(settings)
+    return redis_cls(connection_pool=pool)
 
 
 # Backwards compatible alias.
@@ -87,7 +151,6 @@ def get_redis(**kwargs):
     -------
     server
         Redis client instance.
-
     """
     redis_cls = kwargs.pop("redis_cls", defaults.REDIS_CLS)
     url = kwargs.pop("url", None)

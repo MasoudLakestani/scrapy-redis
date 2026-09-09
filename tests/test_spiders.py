@@ -315,10 +315,11 @@ def test_consume_urls_from_redis(start_urls_as_zset, start_urls_as_set, spider_c
         else:
             assert start_requests == reqs[:batch_size]
 
-        with pytest.raises(DontCloseSpider):
-            spider.spider_idle()
-        with pytest.raises(DontCloseSpider):
-            spider.spider_idle()
+        with mock.patch.object(spider, "idle_backoff_sleep"):
+            with pytest.raises(DontCloseSpider):
+                spider.spider_idle()
+            with pytest.raises(DontCloseSpider):
+                spider.spider_idle()
 
         assert crawler.engine.crawl.call_count == batch_size
 
@@ -451,3 +452,119 @@ class TestRedisMixinMultiKey:
 
         assert [request.url for request in third_batch] == ["http://example.com/high-1"]
         assert spider.redis_key == "high:urls"
+
+
+class TestRedisMixinIdleBackoff:
+
+    def setup(self):
+        self.server = FakeRedisServer()
+        self.crawler = get_crawler()
+
+    setup_method = setup
+
+    def make_spider(self, **kwargs):
+        with patched_redis(self.server):
+            return MySpider.from_crawler(self.crawler, **kwargs)
+
+    def test_exponential_backoff_progression_and_cap(self):
+        spider = self.make_spider(
+            redis_key="test:urls",
+            redis_idle_backoff=True,
+            redis_idle_backoff_min=1.0,
+            redis_idle_backoff_max=30.0,
+            redis_idle_backoff_factor=2.0,
+        )
+        spider.idle_backoff_sleep = mock.Mock()
+
+        # Progression: 1s -> 2s -> 4s -> 8s -> 16s -> 30s (cap) -> 30s
+        expected_delays = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+        for expected in expected_delays:
+            with pytest.raises(DontCloseSpider):
+                spider.spider_idle()
+            assert spider.idle_backoff_sleep.call_args[0][0] == pytest.approx(expected)
+
+    def test_backoff_resets_when_items_appear(self):
+        spider = self.make_spider(
+            redis_key="test:urls",
+            redis_idle_backoff=True,
+            redis_idle_backoff_min=1.0,
+            redis_idle_backoff_max=30.0,
+            redis_idle_backoff_factor=2.0,
+        )
+        spider.idle_backoff_sleep = mock.Mock()
+
+        # Run 3 empty cycles
+        for _ in range(3):
+            with pytest.raises(DontCloseSpider):
+                spider.spider_idle()
+
+        assert spider.idle_backoff_sleep.call_args[0][0] == 4.0
+
+        # Items appear in redis
+        self.server.rpush("test:urls", "http://example.com/url-1")
+        spider.idle_backoff_sleep.reset_mock()
+
+        with pytest.raises(DontCloseSpider):
+            spider.spider_idle()
+
+        # Should not sleep when items are available
+        spider.idle_backoff_sleep.assert_not_called()
+        assert spider._idle_backoff_delay == 0
+
+        # Next idle cycle restarts from min (1.0)
+        with pytest.raises(DontCloseSpider):
+            spider.spider_idle()
+
+        spider.idle_backoff_sleep.assert_called_once_with(1.0)
+
+    def test_backoff_disabled(self):
+        spider = self.make_spider(
+            redis_key="test:urls",
+            redis_idle_backoff=False,
+        )
+        spider.idle_backoff_sleep = mock.Mock()
+
+        with pytest.raises(DontCloseSpider):
+            spider.spider_idle()
+
+        spider.idle_backoff_sleep.assert_not_called()
+
+    def test_backoff_respects_max_idle_time_clamp(self):
+        spider = self.make_spider(
+            redis_key="test:urls",
+            redis_idle_backoff=True,
+            redis_idle_backoff_min=5.0,
+            redis_idle_backoff_max=30.0,
+            max_idle_time=10,
+        )
+        spider.idle_backoff_sleep = mock.Mock()
+        spider.spider_idle_start_time = 0
+
+        with mock.patch("scrapy_redis.spiders.time.time", return_value=8):
+            with pytest.raises(DontCloseSpider):
+                spider.spider_idle()
+
+        # min delay is 5s, but remaining idle time is 10 - 8 = 2s, so sleep must be clamped to 2s
+        spider.idle_backoff_sleep.assert_called_once_with(2.0)
+
+    def test_backoff_custom_settings(self):
+        crawler = get_crawler()
+        crawler.settings.setdict(
+            {
+                "REDIS_IDLE_BACKOFF_ENABLED": True,
+                "REDIS_IDLE_BACKOFF_MIN": 0.5,
+                "REDIS_IDLE_BACKOFF_MAX": 5.0,
+                "REDIS_IDLE_BACKOFF_FACTOR": 3.0,
+            }
+        )
+        with patched_redis(self.server):
+            spider = MySpider.from_crawler(crawler, redis_key="test:urls")
+
+        spider.idle_backoff_sleep = mock.Mock()
+
+        # 0.5 -> 1.5 -> 4.5 -> 5.0 (capped)
+        expected_delays = [0.5, 1.5, 4.5, 5.0]
+        for expected in expected_delays:
+            with pytest.raises(DontCloseSpider):
+                spider.spider_idle()
+            assert spider.idle_backoff_sleep.call_args[0][0] == pytest.approx(expected)

@@ -30,6 +30,13 @@ class RedisMixin:
     _redis_keys = None
     _last_priority_scan = 0
 
+    # Idle backoff attributes
+    redis_idle_backoff = None
+    redis_idle_backoff_min = None
+    redis_idle_backoff_max = None
+    redis_idle_backoff_factor = None
+    _idle_backoff_delay = 0
+
     def start_requests(self):
         """Returns a batch of start requests from redis."""
         return self.next_requests()
@@ -129,6 +136,45 @@ class RedisMixin:
             self.max_idle_time = int(self.max_idle_time)
         except (TypeError, ValueError):
             raise ValueError("max_idle_time must be an integer")
+
+        if self.redis_idle_backoff is None:
+            self.redis_idle_backoff = settings.getbool(
+                "REDIS_IDLE_BACKOFF_ENABLED", defaults.REDIS_IDLE_BACKOFF_ENABLED
+            )
+        else:
+            self.redis_idle_backoff = bool(self.redis_idle_backoff)
+
+        if self.redis_idle_backoff_min is None:
+            self.redis_idle_backoff_min = settings.getfloat(
+                "REDIS_IDLE_BACKOFF_MIN", defaults.REDIS_IDLE_BACKOFF_MIN
+            )
+
+        try:
+            self.redis_idle_backoff_min = float(self.redis_idle_backoff_min)
+        except (TypeError, ValueError):
+            raise ValueError("redis_idle_backoff_min must be a float or integer")
+
+        if self.redis_idle_backoff_max is None:
+            self.redis_idle_backoff_max = settings.getfloat(
+                "REDIS_IDLE_BACKOFF_MAX", defaults.REDIS_IDLE_BACKOFF_MAX
+            )
+
+        try:
+            self.redis_idle_backoff_max = float(self.redis_idle_backoff_max)
+        except (TypeError, ValueError):
+            raise ValueError("redis_idle_backoff_max must be a float or integer")
+
+        if self.redis_idle_backoff_factor is None:
+            self.redis_idle_backoff_factor = settings.getfloat(
+                "REDIS_IDLE_BACKOFF_FACTOR", defaults.REDIS_IDLE_BACKOFF_FACTOR
+            )
+
+        try:
+            self.redis_idle_backoff_factor = float(self.redis_idle_backoff_factor)
+        except (TypeError, ValueError):
+            raise ValueError("redis_idle_backoff_factor must be a float or integer")
+
+        self._idle_backoff_delay = 0
 
         # The idle signal is called when the spider has no requests left,
         # that's when we will schedule new requests from redis queue
@@ -320,22 +366,76 @@ class RedisMixin:
             else:
                 self.crawler.engine.crawl(req, spider=self)
 
+    def idle_backoff_sleep(self, delay):
+        """Sleep for the specified delay in seconds.
+
+        Can be overridden in subclasses or mocked in tests.
+        """
+        time.sleep(delay)
+
     def spider_idle(self):
         """
-        Schedules a request if available, otherwise waits.
+        Schedules a request if available, otherwise waits with exponential backoff,
         or close spider when waiting seconds > MAX_IDLE_TIME_BEFORE_CLOSE.
         MAX_IDLE_TIME_BEFORE_CLOSE will not affect SCHEDULER_IDLE_BEFORE_CLOSE.
         """
         self._maybe_check_priority_scan()
 
-        if self.server is not None and self._any_key_has_items():
+        has_items = self.server is not None and self._any_key_has_items()
+        if has_items:
             self.spider_idle_start_time = int(time.time())
+            self._idle_backoff_delay = 0
 
         self.schedule_next_requests()
 
         idle_time = int(time.time()) - self.spider_idle_start_time
         if self.max_idle_time != 0 and idle_time >= self.max_idle_time:
             return
+
+        if not has_items and getattr(self, "redis_idle_backoff", False):
+            if getattr(self, "_idle_backoff_delay", 0) <= 0:
+                self._idle_backoff_delay = getattr(
+                    self, "redis_idle_backoff_min", defaults.REDIS_IDLE_BACKOFF_MIN
+                )
+            else:
+                backoff_factor = getattr(
+                    self,
+                    "redis_idle_backoff_factor",
+                    defaults.REDIS_IDLE_BACKOFF_FACTOR,
+                )
+                backoff_max = getattr(
+                    self, "redis_idle_backoff_max", defaults.REDIS_IDLE_BACKOFF_MAX
+                )
+                self._idle_backoff_delay = min(
+                    self._idle_backoff_delay * backoff_factor,
+                    backoff_max,
+                )
+
+            sleep_time = self._idle_backoff_delay
+
+            if self.max_idle_time != 0:
+                remaining_idle_time = self.max_idle_time - idle_time
+                if remaining_idle_time > 0:
+                    sleep_time = min(sleep_time, remaining_idle_time)
+
+            if sleep_time > 0:
+                self.logger.info(
+                    "Redis queue is empty. Waiting %(sleep_time)ss before next poll (backoff cap: %(max)ss)",
+                    {
+                        "sleep_time": sleep_time,
+                        "max": getattr(
+                            self,
+                            "redis_idle_backoff_max",
+                            defaults.REDIS_IDLE_BACKOFF_MAX,
+                        ),
+                    },
+                )
+                self.idle_backoff_sleep(sleep_time)
+
+            idle_time = int(time.time()) - self.spider_idle_start_time
+            if self.max_idle_time != 0 and idle_time >= self.max_idle_time:
+                return
+
         raise DontCloseSpider
 
 
