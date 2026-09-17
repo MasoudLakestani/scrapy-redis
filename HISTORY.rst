@@ -11,6 +11,9 @@ Unreleased
 * Added per-crawler Redis connection pool sharing across components.
 
 * Added ``REDIS_MAX_CONNECTIONS`` setting.
+* Added opt-in ``REDIS_PROTOCOL`` (default ``None``) for redis-py >= 5.
+* Documented RESP3 connection-setup and retry considerations.
+* Normalized ``protocol=None`` for shared-pool identity.
 
 0.9.1 (2024-07-06)
 ------------------
